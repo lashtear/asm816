@@ -181,18 +181,18 @@ impl Default for InstructionData {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 #[repr(u16)]
 pub enum Flag {
-    Carry = 0,
-    Zero = 1,
-    InterruptDisable = 2,
-    Decimal = 3,
-    XSizeBreak = 4,
-    MSize = 5,
-    OVerflow = 6,
-    Negative = 7,
-    Emulation = 8,
+    Carry = 1 << 0,
+    Zero = 1 << 1,
+    InterruptDisable = 1 << 2,
+    Decimal = 1 << 3,
+    XSizeBreak = 1 << 4,
+    MSize = 1 << 5,
+    OVerflow = 1 << 6,
+    Negative = 1 << 7,
+    Emulation = 1 << 8,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -211,7 +211,7 @@ impl FlagState {
             Some(Self {
                 flags: flags
                     .iter()
-                    .fold(0, |acc: u16, x: &Flag| acc | x.clone() as u16),
+                    .fold(0, |acc: u16, x: &Flag| (acc | x.clone() as u16)),
             })
         }
     }
@@ -248,5 +248,17 @@ impl EMX {
         self.e = BitStatus::One;
         self.m = BitStatus::One;
         self.x = BitStatus::One;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::data::*;
+
+    #[test]
+    fn instruction_data_is_valid() {
+        assert_eq!(INST[0].mnemonic, "brk");
+        assert_eq!(INST[0xfb].mnemonic, "xce");
+        assert_eq!(INST[0xff].mnemonic, "sbc");
     }
 }
