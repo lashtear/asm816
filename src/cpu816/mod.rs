@@ -1,4 +1,4 @@
-mod data;
+pub mod data;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -202,16 +202,11 @@ pub struct FlagState {
 
 impl FlagState {
     pub fn from_flags(flags: Vec<Flag>) -> Option<Self> {
-        if flags
-            .iter()
-            .any(|f: &Flag| ((f.clone() as u16) & !511 != 0))
-        {
+        if flags.iter().any(|f: &Flag| ((*f as u16) & !511 != 0)) {
             None
         } else {
             Some(Self {
-                flags: flags
-                    .iter()
-                    .fold(0, |acc: u16, x: &Flag| (acc | x.clone() as u16)),
+                flags: flags.iter().fold(0, |acc: u16, x: &Flag| (acc | *x as u16)),
             })
         }
     }
