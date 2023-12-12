@@ -2,8 +2,9 @@ pub mod cpu816;
 
 use clap::Parser;
 use log::*;
-use std::fs::{File, OpenOptions};
+use std::fs::{remove_file, File, OpenOptions};
 use std::io;
+use std::io::ErrorKind::NotFound;
 use std::{path::PathBuf, sync::Arc};
 
 //use chumsky::prelude::*;
@@ -121,6 +122,15 @@ fn level_filter_from_usize(u: usize) -> Option<LevelFilter> {
 
 /// Safely open an output file
 fn open_output(filename: &PathBuf) -> io::Result<File> {
+    // remove existing file as a convenience
+    if let Err(err) = remove_file(filename) {
+        if err.kind() != NotFound {
+            Err(err)?
+        }
+    } else {
+        debug!("Removed existing output file ({filename:?})");
+    }
+    // use atomic create_new() to ensure it truly is a new file
     OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -145,8 +155,7 @@ fn main() {
     env_logger::init_from_env(
         env_logger::Env::new().default_filter_or(
             level_filter_from_usize(args.verbose as usize + 2)
-                .or_else(|| Some(LevelFilter::Trace))
-                .unwrap()
+                .unwrap_or(LevelFilter::Trace)
                 .as_str(),
         ),
     );
