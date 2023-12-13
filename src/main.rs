@@ -1,15 +1,16 @@
 pub mod cpu816;
 
-use clap::Parser;
+use bit_vec::BitVec;
+use chumsky::prelude::*;
+use clap::Parser as _;
 use log::*;
+use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 use std::fs::{remove_file, File, OpenOptions};
-use std::io;
-use std::io::ErrorKind::NotFound;
+use std::io::{self, ErrorKind::NotFound};
 use std::{path::PathBuf, sync::Arc};
 
-//use chumsky::prelude::*;
-
-#[derive(Debug, Parser)]
+#[derive(Debug, clap::Parser)]
 #[command(author, version, about, long_about=None)]
 struct Args {
     #[arg(short = 'v', action= clap::ArgAction::Count, global=true)]
@@ -19,7 +20,7 @@ struct Args {
     command: Command,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, clap::Parser)]
 /// Asm816, an assembler for 65816
 enum Command {
     /// Assemble source code into binary objects
@@ -49,26 +50,126 @@ enum Command {
     },
 }
 
-pub enum AsmToken {
-    Colon,
-    Assign,
-    Plus,
-    Minus,
-    Multiply,
-    Divide,
-    OpenP,
-    CloseP,
-    OpenB,
-    CloseB,
-    Comma,
-    QuotedString(Arc<String>),
-    Id(Arc<String>),
+pub type Span = std::ops::Range<usize>;
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// An atomic value within the assembler's expression evaluation language
+pub enum Atom {
+    Bool(bool),
+    Char(char),
+    Int(i64),
 }
+
+impl Debug for Atom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bool(b) => write!(f, "Atom::Bool({b})"),
+            Self::Char(c) => write!(
+                f,
+                "Atom::Char('{}' {:2>} ${:x})",
+                c.escape_debug(),
+                *c as u32,
+                *c as u32
+            ),
+            Self::Int(i) => write!(f, "Atom::Int({i} ${i:0x})"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+/// A compound value within expressions
+pub enum Value {
+    Float(f64),
+    Atom(Atom),
+    BitMap(BitVec),
+    String(String),
+    ByteArray(Vec<u8>),
+    List(Vec<Value>),
+    Symbol(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Token {
+    Operator(String),
+    Structural(char),
+    Atom(Atom),
+    Identifier(String),
+}
+
+/// Fast decode ASCII digits
+fn digit_val(c: char) -> Result<u8, &'static str> {
+    if ('0'..='~').contains(&c) {
+        if c <= '9' {
+            return Ok((c as u8) - b'0');
+        } else if c > '@' {
+            return Ok(10 + ((c as u8) | 0x20) - b'a');
+        }
+    }
+    Err("invalid digits")
+}
+
+fn based_int(radix: u32) -> impl chumsky::Parser<char, Token, Error = Simple<char>> {
+    text::int(radix)
+        .map(move |s: String| {
+            Token::Atom(Atom::Int(
+                s.chars().flat_map(digit_val).fold(0, |acc, v| {
+                    acc.checked_mul(radix as i64).expect("overflowed i64") + (v as i64)
+                }),
+            ))
+        })
+        .labelled("numeric digits")
+}
+
+fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
+    let num = just('0')
+        .to(Token::Atom(Atom::Int(0)))
+        .then_with(|z| {
+            choice::<_, Simple<char>>((
+                just('d').or_not().ignore_then(based_int(10)),
+                just('x').ignore_then(based_int(16)),
+                just('o').ignore_then(based_int(8)),
+                just('b').ignore_then(based_int(2)),
+            ))
+            .or_not()
+            .map(move |t| t.unwrap_or(z.clone()))
+        })
+        .or(choice::<_, Simple<char>>((
+            just('$').ignore_then(based_int(16)),
+            just('%').ignore_then(based_int(2)),
+            based_int(10),
+        )))
+        .map_with_span(|t, span| (t, span));
+
+    num.padded().repeated().then_ignore(end())
+}
+
+#[derive(Clone, Debug)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    BitAnd,
+    BitOr,
+    BitXor,
+    LogicAnd,
+    LogicOr,
+    ShiftLeft,
+    ShiftRight,
+}
+
+#[derive(Clone, Debug)]
+pub enum UnaryOp {
+    NumericNegate,
+    BitInvert,
+}
+
+type U24 = u32;
 
 pub enum AddressReference {
     Direct(u8),
     Absolute(u16),
-    AbsoluteLong(u32),
+    AbsoluteLong(U24),
     Segment(Arc<String>, u32),
 }
 
@@ -78,33 +179,20 @@ pub struct Symbol {
     width: u8,
 }
 
-pub enum AsmExpr {
-    Num(i64),
-    FloatNum(f64),
-    Str(Arc<String>),
-    Expr(Box<AsmExpr>),
-    BinOp(Binops, Vec<AsmExpr>),
-    UnOp(Unops, Box<AsmExpr>),
-}
+pub type Spanned<T> = (T, Span);
 
-pub enum Binops {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    ShiftLeft,
-    ShiftRight,
-}
-
-pub enum Unops {
-    NumNegate,
-    LogicInvert,
+#[derive(Clone, Debug)]
+pub enum Expr {
+    Value(Value),
+    Expr(Box<Expr>),
+    BinOp(BinaryOp, Vec<Spanned<Self>>),
+    UnOp(UnaryOp, Box<Spanned<Self>>),
 }
 
 pub enum AsmAST {
-    LabelDef { name: String, value: Box<AsmExpr> },
-    Assignment { name: String, value: Box<AsmExpr> },
-    Operation { name: String, args: Vec<AsmExpr> },
+    LabelDef { name: String, value: Box<Expr> },
+    Assignment { name: String, value: Box<Expr> },
+    Operation { name: String, args: Vec<Expr> },
 }
 
 // like LevelFilter::from_usize, but not private to that module
@@ -172,6 +260,12 @@ fn main() {
             } else {
                 check_include_path(&include_paths);
                 let outfile = open_output(&output_file).expect("output file");
+                for file in input_files {
+                    let src = std::fs::read_to_string(file).expect("input");
+                    let (tokens, mut errs) = lexer().parse_recovery(src.as_str());
+                    let summary = format!("{tokens:?} {errs:?}");
+                    info!("{}", summary);
+                }
                 outfile.sync_all().expect("successfully written");
             }
         }
