@@ -3,12 +3,12 @@ name = "asm816"
 version = "0.1.0"
 edition = "2021"
 authors = ["Emily Backes <lashtear@gmail.com>"]
-license = "BSD-3-Clause OR MIT"
+license = "Apache-2.0 OR BSD-3-Clause OR MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ariadne = { version = "0.3.0", features = ["auto-color"] }
+ariadne = { version = "0.3.0", features = ["auto-color", "concolor"] }
 bit-vec = { version = "0.6.3", features = ["serde", "serde_std"] }
 bytes = "1.4.0"
 chumsky = "0.9.2"
@@ -21,7 +21,6 @@ serde = { version = "1.0.193", features = ["derive", "serde_derive"] }
 [profile.release]
 opt-level = 3
 lto = true
-debug = true
 split-debuginfo = "packed"
 
 [profile.dev]

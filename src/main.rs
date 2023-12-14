@@ -1,11 +1,15 @@
-#![allow(dead_code)]
+#![warn(trivial_casts)]
+#![warn(trivial_numeric_casts)]
 pub mod cpu816;
 
+use ariadne::{Color, ColorGenerator, Fmt, Label, Report, ReportKind, Source};
 use bit_vec::BitVec;
+use chumsky::error::SimpleReason;
 use chumsky::prelude::*;
 use clap::Parser as _;
 use log::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fs::{remove_file, File, OpenOptions};
 use std::io::{self, ErrorKind::NotFound};
@@ -193,12 +197,12 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
         .map(|i| Token::Atom(Atom::Int(i)))
         .labelled("number");
 
-    let qchar = none_of("\\\'")
+    let qchar = none_of("\\\'\r\n")
         .or(escaped_char('\''))
         .delimited_by(just('\''), just('\''))
         .map(|c| Token::Atom(Atom::Char(c)));
 
-    let qstr = none_of("\\\"")
+    let qstr = none_of("\\\"\r\n")
         .or(escaped_char('\"'))
         .repeated()
         .collect::<String>()
@@ -225,7 +229,8 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
         .or(just("!=")
             .or(just(":="))
             .map(|s| Token::Operator(s.to_string())))
-        .or(one_of("&|!<>:").map(|c: char| Token::Operator(c.to_string())));
+        .or(one_of("&|!<>:").map(|c: char| Token::Operator(c.to_string())))
+        .labelled("operator");
 
     let structural = one_of::<char, &str, Simple<char>>("[]{}()").map(Token::Structural);
 
@@ -379,9 +384,139 @@ fn main() {
                 let outfile = open_output(&output_file).expect("output file");
                 for file in input_files {
                     let src = std::fs::read_to_string(file).expect("input");
-                    let (tokens, mut errs) = lexer().parse_recovery(src.as_str());
-                    let summary = format!("{tokens:?} {errs:?}");
-                    info!("{}", summary);
+                    let (tokens, errs) = lexer().parse_recovery(src.as_str());
+                    errs.into_iter()
+                        .map(|e| e.map(|c| c.to_string()))
+                        .for_each(|e| {
+                            let e = e.clone();
+                            let mut report = Report::build(ReportKind::Error, (), e.span().start);
+                            let mut expected: HashSet<&Option<String>> = HashSet::new();
+                            e.expected().for_each(|oc| {
+                                expected.insert(oc);
+                            });
+                            let open_string = expected.contains(&Some("\"".to_string()));
+                            let open_char = expected.contains(&Some("\'".to_string()));
+                            let subj = if open_string {
+                                "string literal"
+                            } else {
+                                "character literal"
+                            };
+                            let delim = if open_string { "\"" } else { "\'" };
+                            let litspan =
+                                if let Some(idx) = src.as_str()[0..e.span().start].rfind(&delim) {
+                                    Span {
+                                        start: idx,
+                                        end: e.span().start,
+                                    }
+                                } else {
+                                    Span {
+                                        start: e.span().start,
+                                        end: e.span().start,
+                                    }
+                                };
+                            if *e.reason() == SimpleReason::Unexpected && (open_string || open_char)
+                            {
+                                report = report
+                                    .with_message(format!("Unclosed {}", subj))
+                                    .with_label(
+                                        Label::new(litspan)
+                                            .with_message(format!("Unclosed {}", subj,))
+                                            .with_color(Color::Fixed(9)),
+                                    )
+                                    .with_label(
+                                        Label::new(e.span())
+                                            .with_message(format!(
+                                                "Must be closed before this {}",
+                                                e.found()
+                                                    .unwrap_or(&"end of file".to_string())
+                                                    .escape_debug()
+                                                    .fg(Color::Fixed(11))
+                                            ))
+                                            .with_color(Color::Fixed(11)),
+                                    );
+                            } else {
+                                report = match e.reason() {
+                                    chumsky::error::SimpleReason::Unclosed { span, delimiter } => {
+                                        report
+                                            .with_message(format!(
+                                                "Unclosed delimiter {}",
+                                                delimiter.fg(Color::Yellow)
+                                            ))
+                                            .with_label(
+                                                Label::new(span.clone())
+                                                    .with_message(format!(
+                                                        "Unclosed delimiter {}",
+                                                        delimiter.fg(Color::Yellow)
+                                                    ))
+                                                    .with_color(Color::Yellow),
+                                            )
+                                            .with_label(
+                                                Label::new(e.span())
+                                                    .with_message(format!(
+                                                        "Must be closed before this {}",
+                                                        e.found()
+                                                            .unwrap_or(&"end of file".to_string())
+                                                            .fg(Color::Red)
+                                                    ))
+                                                    .with_color(Color::Red),
+                                            )
+                                    }
+                                    chumsky::error::SimpleReason::Unexpected => report
+                                        .with_message(format!(
+                                            "Unexpected {}, expected {}",
+                                            if let Some(tok) = e.found() {
+                                                format!("token in input ({tok:?})")
+                                            } else {
+                                                "end of input".to_string()
+                                            },
+                                            if e.expected().len() == 0 {
+                                                "something else".to_string()
+                                            } else {
+                                                e.expected()
+                                                    .map(|expected| match expected {
+                                                        Some(expected) => expected.to_string(),
+                                                        None => "end of input".to_string(),
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ")
+                                            }
+                                        ))
+                                        .with_label(
+                                            Label::new(e.span())
+                                                .with_message(format!(
+                                                    "Unexpected token {}",
+                                                    e.found()
+                                                        .unwrap_or(&"end of file".to_string())
+                                                        .fg(Color::Red)
+                                                ))
+                                                .with_color(Color::Red),
+                                        ),
+                                    chumsky::error::SimpleReason::Custom(msg) => {
+                                        report.with_message(msg).with_label(
+                                            Label::new(e.span())
+                                                .with_message(format!("{}", msg.fg(Color::Red)))
+                                                .with_color(Color::Red),
+                                        )
+                                    }
+                                }
+                            };
+
+                            report.finish().print(Source::from(&src)).unwrap();
+                        });
+                    if let Some(tokens) = tokens {
+                        let mut rb =
+                            Report::build(ReportKind::Custom("Debug", Color::Magenta), (), 0)
+                                .with_message("Holy shit tokens");
+                        let mut colors = ColorGenerator::new();
+                        for (tok, span) in tokens.into_iter() {
+                            rb = rb.with_label(
+                                Label::new(span)
+                                    .with_message(format!("{tok:?}"))
+                                    .with_color(colors.next()),
+                            );
+                        }
+                        rb.finish().print(Source::from(&src)).unwrap();
+                    }
                 }
                 outfile.sync_all().expect("successfully written");
             }
@@ -429,8 +564,8 @@ mod tests {
             Ok(vec!((Token::Atom(Atom::Int(65535)), 0..6)))
         );
         assert_eq!(
-            lexer().parse("0x7fffffffffffffff"),
-            Ok(vec!((Token::Atom(Atom::Int(9223372036854775807)), 0..18)))
+            lexer().parse("$7fffffffffffffff"),
+            Ok(vec!((Token::Atom(Atom::Int(9223372036854775807)), 0..17)))
         );
     }
 }

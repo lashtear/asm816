@@ -252,7 +252,7 @@ impl EMX {
 
 lazy_static! {
     static ref INST_NAME: HashSet<&'static str> = {
-        let mut h = HashSet::with_capacity(93);
+        let mut h = HashSet::with_capacity(91);
         data::INST.iter().for_each(|i| {
             h.insert(i.mnemonic);
         });
@@ -266,12 +266,18 @@ pub fn is_insn(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::data::*;
+    use super::data::INST;
+    use super::*;
 
     #[test]
     fn instruction_data_is_valid() {
         assert_eq!(INST[0].mnemonic, "brk");
         assert_eq!(INST[0xfb].mnemonic, "xce");
         assert_eq!(INST[0xff].mnemonic, "sbc");
+    }
+
+    #[test]
+    fn instruction_indices_work() {
+        assert_eq!(INST_NAME.len(), 91);
     }
 }
