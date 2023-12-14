@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+
+use lazy_static::lazy_static;
+
 pub mod data;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -244,6 +248,20 @@ impl EMX {
         self.m = BitStatus::One;
         self.x = BitStatus::One;
     }
+}
+
+lazy_static! {
+    static ref INST_NAME: HashSet<&'static str> = {
+        let mut h = HashSet::with_capacity(93);
+        data::INST.iter().for_each(|i| {
+            h.insert(i.mnemonic);
+        });
+        h
+    };
+}
+
+pub fn is_insn(s: &str) -> bool {
+    INST_NAME.contains(s)
 }
 
 #[cfg(test)]

@@ -90,6 +90,7 @@ enum Token {
     Structural(char),
     Atom(Atom),
     Identifier(String),
+    Instruction(String),
     EndOfLine,
 }
 
@@ -211,7 +212,7 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
         .labelled("comment");
     let semi_comment = just(';').ignore_then(comment_body);
 
-    let op = one_of::<char, &str, Simple<char>>("+-*/^#")
+    let op = one_of::<char, &str, Simple<char>>("+-*/^#,.")
         .map(|c: char| Token::Operator(c.to_string()))
         .or(one_of("&|<>=").then_with(|c: char| {
             just(c).map(move |_| {
@@ -228,7 +229,13 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
 
     let structural = one_of::<char, &str, Simple<char>>("[]{}()").map(Token::Structural);
 
-    let id = text::ident::<char, Simple<char>>().map(Token::Identifier);
+    let id = text::ident::<char, Simple<char>>().map(|s| {
+        if cpu816::is_insn(s.to_ascii_lowercase().as_str()) {
+            Token::Instruction(s)
+        } else {
+            Token::Identifier(s)
+        }
+    });
 
     let horizontal_whitespace = one_of(" \t").repeated().to(());
 
