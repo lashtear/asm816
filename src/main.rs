@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub mod cpu816;
 
 use bit_vec::BitVec;
@@ -105,23 +106,13 @@ fn digit_val(c: char) -> Result<u8, &'static str> {
 }
 
 /// List of ASCII digits for `radix`
-fn radix_choices(radix: u32) -> String {
+fn radix_choices(radix: u32) -> &'static str {
+    const CHARS: &str = "0123456789AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz";
     assert!((2..37).contains(&radix));
     if radix <= 10 {
-        ('0'..='9')
-            .into_iter()
-            .take(radix as usize)
-            .collect::<String>()
+        &CHARS[0..radix as usize]
     } else {
-        "0123456789".to_string()
-            + &('a'..='z')
-                .into_iter()
-                .take(radix as usize - 10)
-                .collect::<String>()
-            + &('A'..='Z')
-                .into_iter()
-                .take(radix as usize - 10)
-                .collect::<String>()
+        &CHARS[0..(radix as usize) * 2 - 10]
     }
 }
 
@@ -130,24 +121,16 @@ fn radix_choices(radix: u32) -> String {
 /// Unlike text::int(), this silently allows leading zeros and
 /// performs the conversion.
 fn based_int(radix: u32) -> impl chumsky::Parser<char, i64, Error = Simple<char>> {
-    one_of::<char, String, Simple<char>>(radix_choices(radix))
+    one_of::<char, &str, Simple<char>>(radix_choices(radix))
         .repeated()
         .at_least(1)
         .collect::<String>()
         .map(move |s: String| {
             s.chars()
                 .flat_map(digit_val)
-                .fold(Some(0), |acc: Option<i64>, v| {
-                    if let Some(acc) = acc {
-                        if let Some(acc) = acc.checked_mul(radix as i64) {
-                            if let Some(acc) = acc.checked_add(v as i64) {
-                                Some(acc)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
+                .try_fold(0i64, |acc: i64, v: u8| -> Option<i64> {
+                    if let Some(acc) = acc.checked_mul(radix as i64) {
+                        acc.checked_add(v as i64)
                     } else {
                         None
                     }
@@ -181,18 +164,25 @@ fn escaped_char(quote: char) -> impl chumsky::Parser<char, char, Error = Simple<
         .labelled("escaped character")
 }
 
+fn justci(chars: &str) -> impl chumsky::Parser<char, char, Error = Simple<char>> {
+    let mut buf = String::with_capacity(chars.len() * 2);
+    buf.push_str(chars.to_ascii_lowercase().as_str());
+    buf.push_str(chars.to_ascii_uppercase().as_str());
+    one_of::<char, String, Simple<char>>(buf)
+}
+
 fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     let num = just('0')
         .to(0)
         .then_with(|z| {
             choice::<_, Simple<char>>((
-                just('d').or_not().ignore_then(based_int(10)),
-                just('x').ignore_then(based_int(16)),
-                just('o').ignore_then(based_int(8)),
-                just('b').ignore_then(based_int(2)),
+                justci("d").or_not().ignore_then(based_int(10)),
+                justci("x").ignore_then(based_int(16)),
+                justci("o").ignore_then(based_int(8)),
+                justci("b").ignore_then(based_int(2)),
             ))
             .or_not()
-            .map(move |t| t.unwrap_or(z.clone()))
+            .map(move |t| t.unwrap_or(z))
         })
         .or(choice::<_, Simple<char>>((
             just('$').ignore_then(based_int(16)),
@@ -236,9 +226,9 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
             .map(|s| Token::Operator(s.to_string())))
         .or(one_of("&|!<>:").map(|c: char| Token::Operator(c.to_string())));
 
-    let structural = one_of::<char, &str, Simple<char>>("[]{}()").map(|c| Token::Structural(c));
+    let structural = one_of::<char, &str, Simple<char>>("[]{}()").map(Token::Structural);
 
-    let id = text::ident::<char, Simple<char>>().map(|s| Token::Identifier(s));
+    let id = text::ident::<char, Simple<char>>().map(Token::Identifier);
 
     let horizontal_whitespace = one_of(" \t").repeated().to(());
 
@@ -422,14 +412,18 @@ mod tests {
             lexer().parse("0x001"),
             Ok(vec!((Token::Atom(Atom::Int(1)), 0..5)))
         );
-        assert_eq!(radix_choices(10), "0123456789".to_string());
+        assert_eq!(radix_choices(10), "0123456789");
         assert_eq!(
             radix_choices(36),
-            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".to_string()
+            "0123456789AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz"
         );
-        assert_eq! {
+        assert_eq!(
             lexer().parse("0xFfFf"),
             Ok(vec!((Token::Atom(Atom::Int(65535)), 0..6)))
-        }
+        );
+        assert_eq!(
+            lexer().parse("0x7fffffffffffffff"),
+            Ok(vec!((Token::Atom(Atom::Int(9223372036854775807)), 0..18)))
+        );
     }
 }
