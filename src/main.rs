@@ -58,20 +58,16 @@ pub enum Atom {
     Bool(bool),
     Char(char),
     Int(i64),
+    String(String),
 }
 
 impl Debug for Atom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bool(b) => write!(f, "Atom::Bool({b})"),
-            Self::Char(c) => write!(
-                f,
-                "Atom::Char('{}' {:2>} ${:x})",
-                c.escape_debug(),
-                *c as u32,
-                *c as u32
-            ),
+            Self::Char(c) => write!(f, "Atom::Char({c:?} {:3>} ${:2x})", *c as u32, *c as u32),
             Self::Int(i) => write!(f, "Atom::Int({i} ${i:0x})"),
+            Self::String(s) => write!(f, "Atom::String({s:?})"),
         }
     }
 }
@@ -82,7 +78,6 @@ pub enum Value {
     Float(f64),
     Atom(Atom),
     BitMap(BitVec),
-    String(String),
     ByteArray(Vec<u8>),
     List(Vec<Value>),
     Symbol(String),
@@ -94,6 +89,7 @@ enum Token {
     Structural(char),
     Atom(Atom),
     Identifier(String),
+    EndOfLine,
 }
 
 /// Fast decode ASCII digits
@@ -108,21 +104,86 @@ fn digit_val(c: char) -> Result<u8, &'static str> {
     Err("invalid digits")
 }
 
-fn based_int(radix: u32) -> impl chumsky::Parser<char, Token, Error = Simple<char>> {
-    text::int(radix)
+/// List of ASCII digits for `radix`
+fn radix_choices(radix: u32) -> String {
+    assert!((2..37).contains(&radix));
+    if radix <= 10 {
+        ('0'..='9')
+            .into_iter()
+            .take(radix as usize)
+            .collect::<String>()
+    } else {
+        "0123456789".to_string()
+            + &('a'..='z')
+                .into_iter()
+                .take(radix as usize - 10)
+                .collect::<String>()
+            + &('A'..='Z')
+                .into_iter()
+                .take(radix as usize - 10)
+                .collect::<String>()
+    }
+}
+
+/// Parse a digit sequence for `radix` and return it as an i64
+///
+/// Unlike text::int(), this silently allows leading zeros and
+/// performs the conversion.
+fn based_int(radix: u32) -> impl chumsky::Parser<char, i64, Error = Simple<char>> {
+    one_of::<char, String, Simple<char>>(radix_choices(radix))
+        .repeated()
+        .at_least(1)
+        .collect::<String>()
         .map(move |s: String| {
-            Token::Atom(Atom::Int(
-                s.chars().flat_map(digit_val).fold(0, |acc, v| {
-                    acc.checked_mul(radix as i64).expect("overflowed i64") + (v as i64)
-                }),
-            ))
+            s.chars()
+                .flat_map(digit_val)
+                .fold(Some(0), |acc: Option<i64>, v| {
+                    if let Some(acc) = acc {
+                        if let Some(acc) = acc.checked_mul(radix as i64) {
+                            if let Some(acc) = acc.checked_add(v as i64) {
+                                Some(acc)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+        })
+        .try_map(|n: Option<i64>, span| {
+            n.ok_or(Simple::custom(span, "numeric literal overflows i64"))
         })
         .labelled("numeric digits")
 }
 
+fn escaped_char(quote: char) -> impl chumsky::Parser<char, char, Error = Simple<char>> {
+    just('\\')
+        .ignore_then(
+            just(quote)
+                .or(just('\\'))
+                .or(one_of("nrt").map(|c| match c {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    _ => unreachable!(),
+                }))
+                .or(just("u{")
+                    .ignore_then(based_int(16))
+                    .then_ignore(just('}'))
+                    .try_map(|n: i64, span| {
+                        char::from_u32(n as u32)
+                            .ok_or(Simple::custom(span, "invalid unicode escape"))
+                    })),
+        )
+        .labelled("escaped character")
+}
+
 fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     let num = just('0')
-        .to(Token::Atom(Atom::Int(0)))
+        .to(0)
         .then_with(|z| {
             choice::<_, Simple<char>>((
                 just('d').or_not().ignore_then(based_int(10)),
@@ -138,9 +199,64 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
             just('%').ignore_then(based_int(2)),
             based_int(10),
         )))
-        .map_with_span(|t, span| (t, span));
+        .map(|i| Token::Atom(Atom::Int(i)))
+        .labelled("number");
 
-    num.padded().repeated().then_ignore(end())
+    let qchar = none_of("\\\'")
+        .or(escaped_char('\''))
+        .delimited_by(just('\''), just('\''))
+        .map(|c| Token::Atom(Atom::Char(c)));
+
+    let qstr = none_of("\\\"")
+        .or(escaped_char('\"'))
+        .repeated()
+        .collect::<String>()
+        .delimited_by(just('\"'), just('\"'))
+        .map(|s| Token::Atom(Atom::String(s)));
+
+    let comment_body = none_of::<char, &str, Simple<char>>("\r\n")
+        .repeated()
+        .ignore_then(text::newline())
+        .to(Token::EndOfLine)
+        .labelled("comment");
+    let semi_comment = just(';').ignore_then(comment_body);
+
+    let op = one_of::<char, &str, Simple<char>>("+-*/^#")
+        .map(|c: char| Token::Operator(c.to_string()))
+        .or(one_of("&|<>=").then_with(|c: char| {
+            just(c).map(move |_| {
+                let mut s = String::with_capacity(2);
+                s.push(c);
+                s.push(c);
+                Token::Operator(s)
+            })
+        }))
+        .or(just("!=")
+            .or(just(":="))
+            .map(|s| Token::Operator(s.to_string())))
+        .or(one_of("&|!<>:").map(|c: char| Token::Operator(c.to_string())));
+
+    let structural = one_of::<char, &str, Simple<char>>("[]{}()").map(|c| Token::Structural(c));
+
+    let id = text::ident::<char, Simple<char>>().map(|s| Token::Identifier(s));
+
+    let horizontal_whitespace = one_of(" \t").repeated().to(());
+
+    let nl = text::newline().to(Token::EndOfLine);
+
+    let lexer = num
+        .or(qchar)
+        .or(qstr)
+        .or(op)
+        .or(semi_comment)
+        .or(structural)
+        .or(id)
+        .or(nl);
+    lexer
+        .map_with_span(|t, span| (t, span))
+        .padded_by(horizontal_whitespace)
+        .repeated()
+        .then_ignore(end())
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +272,10 @@ pub enum BinaryOp {
     LogicOr,
     ShiftLeft,
     ShiftRight,
+    Equal,
+    NotEqual,
+    Greater,
+    Less,
 }
 
 #[derive(Clone, Debug)]
@@ -280,6 +400,36 @@ fn main() {
                 let outfile = open_output(&output_file).expect("output file");
                 outfile.sync_all().expect("successfully written");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lexer_numbers() {
+        assert_eq!(
+            lexer().parse("1234"),
+            Ok(vec!((Token::Atom(Atom::Int(1234)), 0..4)))
+        );
+        assert_eq!(
+            lexer().parse("00"),
+            Ok(vec!((Token::Atom(Atom::Int(0)), 0..2)))
+        );
+        assert_eq!(
+            lexer().parse("0x001"),
+            Ok(vec!((Token::Atom(Atom::Int(1)), 0..5)))
+        );
+        assert_eq!(radix_choices(10), "0123456789".to_string());
+        assert_eq!(
+            radix_choices(36),
+            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".to_string()
+        );
+        assert_eq! {
+            lexer().parse("0xFfFf"),
+            Ok(vec!((Token::Atom(Atom::Int(65535)), 0..6)))
         }
     }
 }
