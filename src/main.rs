@@ -1,12 +1,12 @@
-#![warn(trivial_casts)]
-#![warn(trivial_numeric_casts)]
 pub mod cpu816;
 
 use ariadne::{Color, ColorGenerator, Fmt, Label, Report, ReportKind, Source};
 use bit_vec::BitVec;
 use chumsky::error::SimpleReason;
 use chumsky::prelude::*;
+use chumsky::recovery::Strategy;
 use clap::Parser as _;
+use core::hash::*;
 use log::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -70,8 +70,12 @@ impl Debug for Atom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bool(b) => write!(f, "Atom::Bool({b})"),
-            Self::Char(c) => write!(f, "Atom::Char({c:?} {:3>} ${:2x})", *c as u32, *c as u32),
-            Self::Int(i) => write!(f, "Atom::Int({i} ${i:0x})"),
+            Self::Char(c) => write!(
+                f,
+                "Atom::Char({c:?} /* {:3>} ${:02x} */)",
+                *c as u32, *c as u32
+            ),
+            Self::Int(i) => write!(f, "Atom::Int({i} /* ${i:0x} */)"),
             Self::String(s) => write!(f, "Atom::String({s:?})"),
         }
     }
@@ -96,6 +100,7 @@ enum Token {
     Identifier(String),
     Instruction(String),
     EndOfLine,
+    LexingError(Vec<Token>),
 }
 
 /// Fast decode ASCII digits
@@ -147,6 +152,7 @@ fn based_int(radix: u32) -> impl chumsky::Parser<char, i64, Error = Simple<char>
         .labelled("numeric digits")
 }
 
+/// Parse a valid escaped for a `quote`-string.
 fn escaped_char(quote: char) -> impl chumsky::Parser<char, char, Error = Simple<char>> {
     just('\\')
         .ignore_then(
@@ -170,16 +176,17 @@ fn escaped_char(quote: char) -> impl chumsky::Parser<char, char, Error = Simple<
 }
 
 fn justci(chars: &str) -> impl chumsky::Parser<char, char, Error = Simple<char>> {
-    let mut buf = String::with_capacity(chars.len() * 2);
-    buf.push_str(chars.to_ascii_lowercase().as_str());
-    buf.push_str(chars.to_ascii_uppercase().as_str());
-    one_of::<char, String, Simple<char>>(buf)
+    let mut set: HashSet<char> = HashSet::new();
+    chars.chars().for_each(|c| {
+        set.insert(c.to_ascii_lowercase());
+        set.insert(c.to_ascii_uppercase());
+    });
+    one_of::<char, HashSet<char>, Simple<char>>(set)
 }
 
 fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     let num = just('0')
-        .to(0)
-        .then_with(|z| {
+        .ignore_then(
             choice::<_, Simple<char>>((
                 justci("d").or_not().ignore_then(based_int(10)),
                 justci("x").ignore_then(based_int(16)),
@@ -187,8 +194,8 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
                 justci("b").ignore_then(based_int(2)),
             ))
             .or_not()
-            .map(move |t| t.unwrap_or(z))
-        })
+            .map(|t| t.unwrap_or(0)),
+        )
         .or(choice::<_, Simple<char>>((
             just('$').ignore_then(based_int(16)),
             just('%').ignore_then(based_int(2)),
@@ -199,15 +206,31 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
 
     let qchar = none_of("\\\'\r\n")
         .or(escaped_char('\''))
+        .repeated()
         .delimited_by(just('\''), just('\''))
-        .map(|c| Token::Atom(Atom::Char(c)));
+        .try_map(|v, span| match v.len() {
+            0 => Err(Simple::<char>::custom(span, "empty character")),
+            1 => Ok(Token::Atom(Atom::Char(v[0]))),
+            _ => Err(Simple::<char>::custom(span, "large character")),
+        })
+        .or(just('\'').ignore_then(any().try_map(|_, span| {
+            Err(Simple::<char>::custom(
+                span,
+                "unterminated character".to_string(),
+            ))
+        })))
+        .labelled("character constant");
 
     let qstr = none_of("\\\"\r\n")
         .or(escaped_char('\"'))
         .repeated()
-        .collect::<String>()
         .delimited_by(just('\"'), just('\"'))
-        .map(|s| Token::Atom(Atom::String(s)));
+        .collect::<String>()
+        .map(|s| Token::Atom(Atom::String(s)))
+        .or(just('\"')
+            .then(none_of("\\\"\r\n)]}").or(escaped_char('\"')).repeated())
+            .try_map(|_, span| Err(Simple::<char>::custom(span, "unterminated string"))))
+        .labelled("string constant");
 
     let comment_body = none_of::<char, &str, Simple<char>>("\r\n")
         .repeated()
@@ -235,8 +258,13 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
     let structural = one_of::<char, &str, Simple<char>>("[]{}()").map(Token::Structural);
 
     let id = text::ident::<char, Simple<char>>().map(|s| {
-        if cpu816::is_insn(s.to_ascii_lowercase().as_str()) {
-            Token::Instruction(s)
+        let s_low = s.to_ascii_lowercase();
+        if cpu816::is_insn(s_low.as_str()) {
+            Token::Instruction(s_low)
+        } else if s_low == "true" {
+            Token::Atom(Atom::Bool(true))
+        } else if s_low == "false" {
+            Token::Atom(Atom::Bool(false))
         } else {
             Token::Identifier(s)
         }
@@ -253,8 +281,15 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
         .or(semi_comment)
         .or(structural)
         .or(id)
-        .or(nl);
+        .or(nl.clone());
     lexer
+        .recover_with(skip_parser(
+            none_of(" \t\r\n")
+                .repeated()
+                .at_least(1)
+                .collect::<String>()
+                .map(|c| Token::LexingError(vec![Token::Atom(Atom::String(c[1..].to_string()))])),
+        ))
         .map_with_span(|t, span| (t, span))
         .padded_by(horizontal_whitespace)
         .repeated()
@@ -315,6 +350,19 @@ pub enum AsmAST {
     LabelDef { name: String, value: Box<Expr> },
     Assignment { name: String, value: Box<Expr> },
     Operation { name: String, args: Vec<Expr> },
+}
+
+fn expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + Clone {
+    recursive(|expr| {
+        let raw_expr = recursive(|raw_expr| {
+            let val = select! {
+                Token::Atom(a) => (Expr::Value(Value::Atom(a)), 0..1),
+            }
+            .labelled("value");
+            val
+        });
+        raw_expr
+    })
 }
 
 // like LevelFilter::from_usize, but not private to that module
@@ -384,8 +432,9 @@ fn main() {
                 let outfile = open_output(&output_file).expect("output file");
                 for file in input_files {
                     let src = std::fs::read_to_string(file).expect("input");
-                    let (tokens, errs) = lexer().parse_recovery(src.as_str());
-                    errs.into_iter()
+                    let (tokens, lex_errs) = lexer().parse_recovery(src.as_str());
+                    lex_errs
+                        .into_iter()
                         .map(|e| e.map(|c| c.to_string()))
                         .for_each(|e| {
                             let e = e.clone();
@@ -420,48 +469,37 @@ fn main() {
                                     .with_message(format!("Unclosed {}", subj))
                                     .with_label(
                                         Label::new(litspan)
-                                            .with_message(format!("Unclosed {}", subj,))
+                                            .with_message(format!("Unclosed {}", subj))
                                             .with_color(Color::Fixed(9)),
                                     )
                                     .with_label(
                                         Label::new(e.span())
                                             .with_message(format!(
                                                 "Must be closed before this {}",
-                                                e.found()
-                                                    .unwrap_or(&"end of file".to_string())
-                                                    .escape_debug()
-                                                    .fg(Color::Fixed(11))
+                                                match e.found() {
+                                                    Some(exp) => {
+                                                        if exp.starts_with("\n")
+                                                            || exp.starts_with("\r")
+                                                        {
+                                                            "end of line"
+                                                        } else {
+                                                            exp
+                                                        }
+                                                    }
+                                                    None => "end of file",
+                                                }
+                                                .to_string()
+                                                .fg(Color::Fixed(11))
                                             ))
                                             .with_color(Color::Fixed(11)),
                                     );
+                            //						.with_color(Color::Fixed(11)))));
                             } else {
                                 report = match e.reason() {
-                                    chumsky::error::SimpleReason::Unclosed { span, delimiter } => {
-                                        report
-                                            .with_message(format!(
-                                                "Unclosed delimiter {}",
-                                                delimiter.fg(Color::Yellow)
-                                            ))
-                                            .with_label(
-                                                Label::new(span.clone())
-                                                    .with_message(format!(
-                                                        "Unclosed delimiter {}",
-                                                        delimiter.fg(Color::Yellow)
-                                                    ))
-                                                    .with_color(Color::Yellow),
-                                            )
-                                            .with_label(
-                                                Label::new(e.span())
-                                                    .with_message(format!(
-                                                        "Must be closed before this {}",
-                                                        e.found()
-                                                            .unwrap_or(&"end of file".to_string())
-                                                            .fg(Color::Red)
-                                                    ))
-                                                    .with_color(Color::Red),
-                                            )
+                                    SimpleReason::Unclosed { .. } => {
+                                        unreachable!()
                                     }
-                                    chumsky::error::SimpleReason::Unexpected => report
+                                    SimpleReason::Unexpected => report
                                         .with_message(format!(
                                             "Unexpected {}, expected {}",
                                             if let Some(tok) = e.found() {
@@ -487,18 +525,22 @@ fn main() {
                                                     "Unexpected token {}",
                                                     e.found()
                                                         .unwrap_or(&"end of file".to_string())
+                                                        .escape_debug()
                                                         .fg(Color::Red)
                                                 ))
                                                 .with_color(Color::Red),
                                         ),
-                                    chumsky::error::SimpleReason::Custom(msg) => {
+                                    SimpleReason::Custom(msg) => {
                                         report.with_message(msg).with_label(
                                             Label::new(e.span())
-                                                .with_message(format!("{}", msg.fg(Color::Red)))
+                                                .with_message(format!(
+                                                    "{}",
+                                                    msg.escape_debug().fg(Color::Red)
+                                                ))
                                                 .with_color(Color::Red),
                                         )
                                     }
-                                }
+                                };
                             };
 
                             report.finish().print(Source::from(&src)).unwrap();
@@ -567,5 +609,19 @@ mod tests {
             lexer().parse("$7fffffffffffffff"),
             Ok(vec!((Token::Atom(Atom::Int(9223372036854775807)), 0..17)))
         );
+    }
+
+    #[test]
+    fn byte_exercise_based_int() {
+        (0u8..=core::u8::MAX).for_each(|n| {
+            let p16 = based_int(16).padded().then_ignore(end());
+            assert_eq!(p16.parse(format!("{n: >2x}")), Ok(n as i64));
+            assert_eq!(p16.parse(format!("{n: >2X}")), Ok(n as i64));
+            assert_eq!(p16.parse(format!("{n:0>2x}")), Ok(n as i64));
+            assert_eq!(p16.parse(format!("{n:0>2X}")), Ok(n as i64));
+            let p10 = based_int(10).padded().then_ignore(end());
+            assert_eq!(p10.parse(format!("{n: >3}")), Ok(n as i64));
+            assert_eq!(p10.parse(format!("{n:0>3}")), Ok(n as i64));
+        });
     }
 }
