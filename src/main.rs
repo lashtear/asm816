@@ -4,7 +4,6 @@ use ariadne::{Color, ColorGenerator, Fmt, Label, Report, ReportKind, Source};
 use bit_vec::BitVec;
 use chumsky::error::SimpleReason;
 use chumsky::prelude::*;
-use chumsky::recovery::Strategy;
 use clap::Parser as _;
 use core::hash::*;
 use log::*;
@@ -204,32 +203,67 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
         .map(|i| Token::Atom(Atom::Int(i)))
         .labelled("number");
 
-    let qchar = none_of("\\\'\r\n")
-        .or(escaped_char('\''))
-        .repeated()
-        .delimited_by(just('\''), just('\''))
-        .try_map(|v, span| match v.len() {
-            0 => Err(Simple::<char>::custom(span, "empty character")),
-            1 => Ok(Token::Atom(Atom::Char(v[0]))),
-            _ => Err(Simple::<char>::custom(span, "large character")),
+    // let qchar = none_of("\\\'\r\n")
+    //     .or(escaped_char('\''))
+    //     .repeated()
+    //     .delimited_by(just('\''), just('\''))
+    //     .try_map(|v, span| match v.len() {
+    //         0 => Err(Simple::<char>::custom(span, "empty character")),
+    //         1 => Ok(Token::Atom(Atom::Char(v[0]))),
+    //         _ => Err(Simple::<char>::custom(span, "large character")),
+    //     })
+    //     .or(just('\'').ignore_then(any().try_map(|_, span| {
+    //         Err(Simple::<char>::custom(
+    //             span,
+    //             "unterminated character".to_string(),
+    //         ))
+    //     })))
+    //     .labelled("character constant");
+
+    let qchar = just('\'')
+        .then(
+            none_of("\\'\r\n")
+                .or(escaped_char('\''))
+                .repeated()
+                .collect::<String>(),
+        )
+        .map_with_span(|(_opener, s), span| (s, span))
+        .then(just('\'').or_not())
+        .try_map(|((s, span), close), cl_span| {
+            let span = Span {
+                end: cl_span.end,
+                ..span
+            };
+            if close.is_some() {
+                match s.len() {
+                    0 => Err(Simple::<char>::custom(span, "empty character")),
+                    1 => Ok(Token::Atom(Atom::Char(s.chars().nth(0).unwrap()))),
+                    _ => Err(Simple::<char>::custom(span, "large character")),
+                }
+            } else {
+                Err(Simple::<char>::custom(span, "unterminated character"))
+            }
         })
-        .or(just('\'').ignore_then(any().try_map(|_, span| {
-            Err(Simple::<char>::custom(
-                span,
-                "unterminated character".to_string(),
-            ))
-        })))
         .labelled("character constant");
 
-    let qstr = none_of("\\\"\r\n")
-        .or(escaped_char('\"'))
-        .repeated()
-        .delimited_by(just('\"'), just('\"'))
-        .collect::<String>()
-        .map(|s| Token::Atom(Atom::String(s)))
-        .or(just('\"')
-            .then(none_of("\\\"\r\n)]}").or(escaped_char('\"')).repeated())
-            .try_map(|_, span| Err(Simple::<char>::custom(span, "unterminated string"))))
+    let qstr = just('\"')
+        .ignore_then(
+            none_of("\\\"\r\n")
+                .or(escaped_char('\"'))
+                .repeated()
+                .collect::<String>()
+                .map_with_span(|s, span| (s, span)),
+        )
+        .then_with(|(s, span)| {
+            let s = s.clone();
+            just('\"').or_not().try_map(move |t, _span| {
+                if t.is_some() {
+                    Ok(Token::Atom(Atom::String(s.clone())))
+                } else {
+                    Err(Simple::<char>::custom(span.clone(), "unterminated string"))
+                }
+            })
+        })
         .labelled("string constant");
 
     let comment_body = none_of::<char, &str, Simple<char>>("\r\n")
@@ -277,19 +311,27 @@ fn lexer() -> impl chumsky::Parser<char, Vec<(Token, Span)>, Error = Simple<char
     let lexer = num
         .or(qchar)
         .or(qstr)
+        .recover_with(skip_parser(
+            none_of("\r\n)]},;")
+                .repeated()
+                .at_least(1)
+                .collect::<String>()
+                .map(|c| {
+                    Token::LexingError(vec![Token::Atom(if c.starts_with('"') {
+                        Atom::String(c[1..].to_string())
+                    } else if c.starts_with('\'') {
+                        Atom::Char(c.chars().nth(1).unwrap_or(' '))
+                    } else {
+                        Atom::String(c.escape_debug().to_string())
+                    })])
+                }),
+        ))
         .or(op)
         .or(semi_comment)
         .or(structural)
         .or(id)
         .or(nl.clone());
     lexer
-        .recover_with(skip_parser(
-            none_of(" \t\r\n")
-                .repeated()
-                .at_least(1)
-                .collect::<String>()
-                .map(|c| Token::LexingError(vec![Token::Atom(Atom::String(c[1..].to_string()))])),
-        ))
         .map_with_span(|t, span| (t, span))
         .padded_by(horizontal_whitespace)
         .repeated()
@@ -478,8 +520,8 @@ fn main() {
                                                 "Must be closed before this {}",
                                                 match e.found() {
                                                     Some(exp) => {
-                                                        if exp.starts_with("\n")
-                                                            || exp.starts_with("\r")
+                                                        if exp.starts_with('\n')
+                                                            || exp.starts_with('\r')
                                                         {
                                                             "end of line"
                                                         } else {
