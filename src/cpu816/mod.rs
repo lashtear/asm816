@@ -28,6 +28,7 @@ pub enum AddressMode {
     ImmediateMSize,
     ImmediateXSize,
     Implied,
+    Accumulator,
     StackRelative,
     StackRelativeIndirectIndexedY,
     Relative8,
